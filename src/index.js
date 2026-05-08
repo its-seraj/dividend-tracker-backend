@@ -30,7 +30,7 @@ async function main() {
     res.json({ ok: true, lastRun: lastRun || null });
   });
 
-  app.use('/dividends', dividendsRouter);
+  app.use('/', dividendsRouter);
 
   app.listen(PORT, () => console.log(`[api] listening on http://localhost:${PORT}`));
 
