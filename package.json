@@ -1,0 +1,26 @@
+{
+  "name": "dividend-tracker-server",
+  "version": "1.0.0",
+  "description": "Express API that scrapes NSE forthcoming dividends and serves them to the React UI",
+  "main": "src/index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "axios-cookiejar-support": "^5.0.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "mongoose": "^8.7.0",
+    "morgan": "^1.10.0",
+    "node-cron": "^3.0.3",
+    "p-limit": "^3.1.0",
+    "tough-cookie": "^5.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.7"
+  }
+}
