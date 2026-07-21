@@ -130,7 +130,7 @@ async function persistBseRows(rows) {
  * Sweeps MongoDB records missing `lastPrice` and fetches stock prices via Gemini Flash.
  * Recalculates dividendOnExPct and updates database.
  */
-async function backfillMissingPrices({ scope = 'all', limit = 100, batchSize = 10 } = {}) {
+async function backfillMissingPrices({ scope = 'all', limit = 100, batchSize = 25 } = {}) {
   const today = startOfDay(new Date());
   const query = {
     $or: [{ lastPrice: null }, { lastPrice: { $exists: false } }],

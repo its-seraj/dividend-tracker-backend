@@ -69,13 +69,14 @@ async function fetchStockPricesWithGemini(items) {
   if (toFetch.length === 0) return results;
 
   const ai = new GoogleGenAI({ apiKey });
-  const BATCH_SIZE = 10;
+  const modelName = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
+  const BATCH_SIZE = Number(process.env.GEMINI_BATCH_SIZE) || 25;
   const totalBatches = Math.ceil(toFetch.length / BATCH_SIZE);
 
   for (let i = 0; i < toFetch.length; i += BATCH_SIZE) {
     const chunk = toFetch.slice(i, i + BATCH_SIZE);
     const batchNum = Math.floor(i / BATCH_SIZE) + 1;
-    console.log(`[gemini] Processing batch ${batchNum}/${totalBatches} (${chunk.length} symbols: ${chunk.map((c) => c.symbol).join(', ')})`);
+    console.log(`[gemini] Processing batch ${batchNum}/${totalBatches} (${chunk.length} symbols using ${modelName})...`);
 
     const stockListText = chunk
       .map((s, idx) => `${idx + 1}. Symbol: ${s.symbol}${s.companyName ? `, Company: ${s.companyName}` : ''}`)
@@ -92,12 +93,12 @@ Instructions:
 4. If a stock price cannot be found, map its symbol to null.`;
 
     let success = false;
-    const MAX_RETRIES = 2;
+    const MAX_RETRIES = 3;
 
     for (let attempt = 1; attempt <= MAX_RETRIES + 1; attempt += 1) {
       try {
         const response = await ai.models.generateContent({
-          model: 'gemini-2.5-flash',
+          model: modelName,
           contents: prompt,
           config: {
             tools: [{ googleSearch: {} }],
@@ -120,23 +121,32 @@ Instructions:
           console.warn(`[gemini] Attempt ${attempt}/${MAX_RETRIES + 1}: Failed to parse JSON response for batch ${batchNum}`);
         }
       } catch (err) {
-        console.warn(`[gemini] Attempt ${attempt}/${MAX_RETRIES + 1} error for batch ${batchNum}:`, err.message);
+        const is429 = err.message && (err.message.includes('429') || err.message.includes('RESOURCE_EXHAUSTED'));
+        const delayMatch = err.message && err.message.match(/retry in ([\d\.]+)s/i);
+        const delayMs = delayMatch ? Math.ceil(parseFloat(delayMatch[1]) * 1000) + 2000 : (is429 ? 35000 : 3000 * attempt);
+
+        if (is429) {
+          console.warn(`[gemini] Rate limit hit (429) on attempt ${attempt}/${MAX_RETRIES + 1}. Waiting ${(delayMs / 1000).toFixed(1)}s before retrying...`);
+        } else {
+          console.warn(`[gemini] Attempt ${attempt}/${MAX_RETRIES + 1} error for batch ${batchNum}: ${err.message}`);
+        }
+
         if (attempt <= MAX_RETRIES) {
-          await new Promise((resolve) => setTimeout(resolve, 1500 * attempt));
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
         }
       }
     }
 
     if (!success) {
-      console.error(`[gemini] Batch ${batchNum} failed after retries. Setting symbols to null.`);
+      console.error(`[gemini] Batch ${batchNum} failed after ${MAX_RETRIES + 1} attempts. Setting symbols to null.`);
       for (const item of chunk) {
         results[item.symbol] = null;
       }
     }
 
-    // Delay 1 second between batches to avoid rate limits
+    // Delay between batches to stay under RPM limit
     if (i + BATCH_SIZE < toFetch.length) {
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+      await new Promise((resolve) => setTimeout(resolve, 2000));
     }
   }
 
