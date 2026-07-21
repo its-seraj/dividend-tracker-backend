@@ -70,9 +70,13 @@ async function fetchStockPricesWithGemini(items) {
 
   const ai = new GoogleGenAI({ apiKey });
   const BATCH_SIZE = 10;
+  const totalBatches = Math.ceil(toFetch.length / BATCH_SIZE);
 
   for (let i = 0; i < toFetch.length; i += BATCH_SIZE) {
     const chunk = toFetch.slice(i, i + BATCH_SIZE);
+    const batchNum = Math.floor(i / BATCH_SIZE) + 1;
+    console.log(`[gemini] Processing batch ${batchNum}/${totalBatches} (${chunk.length} symbols: ${chunk.map((c) => c.symbol).join(', ')})`);
+
     const stockListText = chunk
       .map((s, idx) => `${idx + 1}. Symbol: ${s.symbol}${s.companyName ? `, Company: ${s.companyName}` : ''}`)
       .join('\n');
@@ -87,36 +91,52 @@ Instructions:
 3. Do not include markdown formatting or backticks around the JSON.
 4. If a stock price cannot be found, map its symbol to null.`;
 
-    try {
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: prompt,
-        config: {
-          tools: [{ googleSearch: {} }],
-        },
-      });
+    let success = false;
+    const MAX_RETRIES = 2;
 
-      const parsed = parseJsonFromResponse(response.text);
+    for (let attempt = 1; attempt <= MAX_RETRIES + 1; attempt += 1) {
+      try {
+        const response = await ai.models.generateContent({
+          model: 'gemini-2.5-flash',
+          contents: prompt,
+          config: {
+            tools: [{ googleSearch: {} }],
+          },
+        });
 
-      if (parsed && typeof parsed === 'object') {
-        for (const item of chunk) {
-          const sym = item.symbol;
-          const rawVal = parsed[sym] !== undefined ? parsed[sym] : parsed[sym.toLowerCase()];
-          const price = typeof rawVal === 'number' && rawVal > 0 ? Number(rawVal.toFixed(2)) : null;
-          results[sym] = price;
-          cache.set(sym, { at: now, price });
+        const parsed = parseJsonFromResponse(response.text);
+
+        if (parsed && typeof parsed === 'object') {
+          for (const item of chunk) {
+            const sym = item.symbol;
+            const rawVal = parsed[sym] !== undefined ? parsed[sym] : parsed[sym.toLowerCase()];
+            const price = typeof rawVal === 'number' && rawVal > 0 ? Number(rawVal.toFixed(2)) : null;
+            results[sym] = price;
+            cache.set(sym, { at: now, price });
+          }
+          success = true;
+          break;
+        } else {
+          console.warn(`[gemini] Attempt ${attempt}/${MAX_RETRIES + 1}: Failed to parse JSON response for batch ${batchNum}`);
         }
-      } else {
-        console.warn('[gemini] Failed to parse JSON response from Gemini:', response.text);
-        for (const item of chunk) {
-          results[item.symbol] = null;
+      } catch (err) {
+        console.warn(`[gemini] Attempt ${attempt}/${MAX_RETRIES + 1} error for batch ${batchNum}:`, err.message);
+        if (attempt <= MAX_RETRIES) {
+          await new Promise((resolve) => setTimeout(resolve, 1500 * attempt));
         }
       }
-    } catch (err) {
-      console.error(`[gemini] Error fetching price chunk for symbols [${chunk.map((c) => c.symbol).join(', ')}]:`, err.message);
+    }
+
+    if (!success) {
+      console.error(`[gemini] Batch ${batchNum} failed after retries. Setting symbols to null.`);
       for (const item of chunk) {
         results[item.symbol] = null;
       }
+    }
+
+    // Delay 1 second between batches to avoid rate limits
+    if (i + BATCH_SIZE < toFetch.length) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
     }
   }
 

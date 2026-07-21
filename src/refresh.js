@@ -130,7 +130,7 @@ async function persistBseRows(rows) {
  * Sweeps MongoDB records missing `lastPrice` and fetches stock prices via Gemini Flash.
  * Recalculates dividendOnExPct and updates database.
  */
-async function backfillMissingPrices({ scope = 'all', limit = 100 } = {}) {
+async function backfillMissingPrices({ scope = 'all', limit = 100, batchSize = 10 } = {}) {
   const today = startOfDay(new Date());
   const query = {
     $or: [{ lastPrice: null }, { lastPrice: { $exists: false } }],
@@ -151,37 +151,42 @@ async function backfillMissingPrices({ scope = 'all', limit = 100 } = {}) {
     return { totalTargeted: 0, updated: 0, failed: 0, scope, message: 'No records found missing lastPrice' };
   }
 
-  const items = docs.map((doc) => ({
-    symbol: doc.symbol,
-    companyName: doc.companyName,
-  }));
-
-  const prices = await fetchStockPricesWithGemini(items);
-
   let updatedCount = 0;
   let failedCount = 0;
+  const totalBatches = Math.ceil(docs.length / batchSize);
+  console.log(`[backfill] Starting backfill for ${docs.length} records in ${totalBatches} batches (batch size: ${batchSize})...`);
 
-  for (const doc of docs) {
-    const price = prices[doc.symbol];
-    if (price && typeof price === 'number' && price > 0) {
-      const dividendOnExPct =
-        doc.dividendAmount && price
-          ? Number(((doc.dividendAmount / price) * 100).toFixed(3))
-          : null;
+  for (let i = 0; i < docs.length; i += batchSize) {
+    const chunk = docs.slice(i, i + batchSize);
+    const items = chunk.map((doc) => ({
+      symbol: doc.symbol,
+      companyName: doc.companyName,
+    }));
 
-      await Dividend.updateOne(
-        { _id: doc._id },
-        {
-          $set: {
-            lastPrice: price,
-            dividendOnExPct,
-            enrichedAt: new Date(),
-          },
-        }
-      );
-      updatedCount += 1;
-    } else {
-      failedCount += 1;
+    const prices = await fetchStockPricesWithGemini(items);
+
+    for (const doc of chunk) {
+      const price = prices[doc.symbol];
+      if (price && typeof price === 'number' && price > 0) {
+        const dividendOnExPct =
+          doc.dividendAmount && price
+            ? Number(((doc.dividendAmount / price) * 100).toFixed(3))
+            : null;
+
+        await Dividend.updateOne(
+          { _id: doc._id },
+          {
+            $set: {
+              lastPrice: price,
+              dividendOnExPct,
+              enrichedAt: new Date(),
+            },
+          }
+        );
+        updatedCount += 1;
+      } else {
+        failedCount += 1;
+      }
     }
   }
 
