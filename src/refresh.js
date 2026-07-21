@@ -1,6 +1,7 @@
 const { fetchForthcomingDividends } = require('./scraper/nseScraper');
 const { fetchBseDividends } = require('./scraper/bseScraper');
 const { getQuote } = require('./scraper/nseQuote');
+const { fetchStockPricesWithGemini } = require('./services/geminiPrice');
 const { Dividend, ScrapeRun } = require('./models/Dividend');
 
 const DEFAULT_PAST_DAYS = 30;
@@ -125,6 +126,73 @@ async function persistBseRows(rows) {
   return { inserted, updated, skipped, errors };
 }
 
+/**
+ * Sweeps MongoDB records missing `lastPrice` and fetches stock prices via Gemini Flash.
+ * Recalculates dividendOnExPct and updates database.
+ */
+async function backfillMissingPrices({ scope = 'all', limit = 100 } = {}) {
+  const today = startOfDay(new Date());
+  const query = {
+    $or: [{ lastPrice: null }, { lastPrice: { $exists: false } }],
+  };
+
+  if (scope === 'historical') {
+    query.exDate = { $lt: today };
+  } else if (scope === 'upcoming') {
+    query.exDate = { $gte: today };
+  }
+
+  const docs = await Dividend.find(query)
+    .sort({ exDate: -1 })
+    .limit(limit)
+    .lean();
+
+  if (docs.length === 0) {
+    return { totalTargeted: 0, updated: 0, failed: 0, scope, message: 'No records found missing lastPrice' };
+  }
+
+  const items = docs.map((doc) => ({
+    symbol: doc.symbol,
+    companyName: doc.companyName,
+  }));
+
+  const prices = await fetchStockPricesWithGemini(items);
+
+  let updatedCount = 0;
+  let failedCount = 0;
+
+  for (const doc of docs) {
+    const price = prices[doc.symbol];
+    if (price && typeof price === 'number' && price > 0) {
+      const dividendOnExPct =
+        doc.dividendAmount && price
+          ? Number(((doc.dividendAmount / price) * 100).toFixed(3))
+          : null;
+
+      await Dividend.updateOne(
+        { _id: doc._id },
+        {
+          $set: {
+            lastPrice: price,
+            dividendOnExPct,
+            enrichedAt: new Date(),
+          },
+        }
+      );
+      updatedCount += 1;
+    } else {
+      failedCount += 1;
+    }
+  }
+
+  return {
+    totalTargeted: docs.length,
+    updated: updatedCount,
+    failed: failedCount,
+    scope,
+  };
+}
+
 async function runRefreshOnce({
   pastDays = DEFAULT_PAST_DAYS,
   futureDays = DEFAULT_FUTURE_DAYS,
@@ -169,6 +237,16 @@ async function runRefreshOnce({
       }
     }
 
+    // Perform Gemini stock price backfill for rows missing lastPrice
+    try {
+      const backfillRes = await backfillMissingPrices({ scope: 'all', limit: 50 });
+      if (backfillRes.updated > 0) {
+        totalUpdated += backfillRes.updated;
+      }
+    } catch (gErr) {
+      allErrors.push(`Gemini backfill: ${gErr.message}`);
+    }
+
     success = true;
   } catch (err) {
     allErrors.push(`refresh: ${err.message}`);
@@ -196,4 +274,5 @@ async function refreshDividends(opts) {
   return inFlight;
 }
 
-module.exports = { refreshDividends };
+module.exports = { refreshDividends, backfillMissingPrices };
+

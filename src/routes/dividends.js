@@ -1,6 +1,6 @@
 const express = require('express');
 const { Dividend, ScrapeRun } = require('../models/Dividend');
-const { refreshDividends } = require('../refresh');
+const { refreshDividends, backfillMissingPrices } = require('../refresh');
 
 const router = express.Router();
 
@@ -129,4 +129,16 @@ router.post('/refresh', async (_req, res) => {
   }
 });
 
+router.post('/backfill-prices', async (req, res) => {
+  try {
+    const scope = req.body?.scope || req.query?.scope || 'all';
+    const limit = Number(req.body?.limit || req.query?.limit) || 100;
+    const result = await backfillMissingPrices({ scope, limit });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 module.exports = router;
+
