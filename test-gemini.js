@@ -15,7 +15,7 @@ async function runTest() {
     { symbol: 'INFY', companyName: 'Infosys Ltd' },
   ];
 
-  console.log('Sending symbols to Gemini 2.5 Flash with Google Search Grounding...');
+  console.log('Sending symbols to Gemini 2.0 Flash with Google Search Grounding...');
   console.time('Gemini Lookup Time');
   
   try {

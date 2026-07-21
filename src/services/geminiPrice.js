@@ -69,14 +69,14 @@ async function fetchStockPricesWithGemini(items) {
   if (toFetch.length === 0) return results;
 
   const ai = new GoogleGenAI({ apiKey });
-  const modelName = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
+  const primaryModel = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
   const BATCH_SIZE = Number(process.env.GEMINI_BATCH_SIZE) || 25;
   const totalBatches = Math.ceil(toFetch.length / BATCH_SIZE);
 
   for (let i = 0; i < toFetch.length; i += BATCH_SIZE) {
     const chunk = toFetch.slice(i, i + BATCH_SIZE);
     const batchNum = Math.floor(i / BATCH_SIZE) + 1;
-    console.log(`[gemini] Processing batch ${batchNum}/${totalBatches} (${chunk.length} symbols using ${modelName})...`);
+    console.log(`[gemini] Processing batch ${batchNum}/${totalBatches} (${chunk.length} symbols)...`);
 
     const stockListText = chunk
       .map((s, idx) => `${idx + 1}. Symbol: ${s.symbol}${s.companyName ? `, Company: ${s.companyName}` : ''}`)
@@ -94,11 +94,13 @@ Instructions:
 
     let success = false;
     const MAX_RETRIES = 3;
+    const modelCandidates = [primaryModel, 'gemini-2.0-flash', 'gemini-2.5-flash'];
 
     for (let attempt = 1; attempt <= MAX_RETRIES + 1; attempt += 1) {
+      const currentModel = modelCandidates[(attempt - 1) % modelCandidates.length];
       try {
         const response = await ai.models.generateContent({
-          model: modelName,
+          model: currentModel,
           contents: prompt,
           config: {
             tools: [{ googleSearch: {} }],
