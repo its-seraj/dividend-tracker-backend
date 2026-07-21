@@ -1,4 +1,5 @@
 const { GoogleGenAI } = require('@google/genai');
+const axios = require('axios');
 
 const cache = new Map();
 const TTL_MS = 60 * 60 * 1000; // 1 hour cache
@@ -30,17 +31,69 @@ function parseJsonFromResponse(text) {
 }
 
 /**
+ * Fallback service using Groq API with llama-3.3-70b-versatile model.
+ */
+async function fetchStockPricesWithGroq(chunk) {
+  const apiKey = process.env.GROQ_API_KEY || process.env.GROK_API_KEY;
+  if (!apiKey) {
+    console.warn('[groq] GROQ_API_KEY is not set in environment. Cannot perform Groq fallback.');
+    return null;
+  }
+
+  const stockListText = chunk
+    .map((s, idx) => `${idx + 1}. Symbol: ${s.symbol}${s.companyName ? `, Company: ${s.companyName}` : ''}`)
+    .join('\n');
+
+  console.log(`[groq] Calling Groq model (llama-3.3-70b-versatile) for ${chunk.length} symbols...`);
+
+  try {
+    const res = await axios.post(
+      'https://api.groq.com/openai/v1/chat/completions',
+      {
+        model: 'llama-3.3-70b-versatile',
+        messages: [
+          {
+            role: 'system',
+            content:
+              'You are a financial data assistant. Return ONLY a raw, valid JSON object mapping each Indian stock Symbol (traded on NSE/BSE) to its current or estimated stock price in INR (e.g. {"RELIANCE": 2980.5, "TCS": 3850.0}). If unknown, map to null.',
+          },
+          {
+            role: 'user',
+            content: `Find the stock price in INR for these stocks:\n${stockListText}`,
+          },
+        ],
+        temperature: 0.1,
+        response_format: { type: 'json_object' },
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 15000,
+      }
+    );
+
+    const content = res.data?.choices?.[0]?.message?.content;
+    const parsed = parseJsonFromResponse(content);
+    if (parsed && typeof parsed === 'object') {
+      console.log(`[groq] Groq model (llama-3.3-70b-versatile) response successful!`);
+      return parsed;
+    }
+  } catch (err) {
+    const errMsg = err.response?.data?.error?.message || err.message;
+    console.error(`[groq] Groq API error (${err.response?.status || 'network'}):`, errMsg);
+  }
+  return null;
+}
+
+/**
  * Fetch current stock prices in INR for a list of items using Gemini Flash with Google Search Grounding.
+ * Falls back to Groq (llama-3.3-70b-versatile) on Gemini failure.
  * @param {Array<{symbol: string, companyName?: string}|string>} items List of stock symbols or objects
  * @returns {Promise<Record<string, number|null>>} Map of symbol -> lastPrice (number or null)
  */
 async function fetchStockPricesWithGemini(items) {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    console.warn('[gemini] GEMINI_API_KEY is not set. Skipping Gemini price lookup.');
-    return {};
-  }
-
   if (!Array.isArray(items) || items.length === 0) return {};
 
   const normalized = items
@@ -68,21 +121,27 @@ async function fetchStockPricesWithGemini(items) {
 
   if (toFetch.length === 0) return results;
 
-  const ai = new GoogleGenAI({ apiKey });
+  const geminiApiKey = process.env.GEMINI_API_KEY;
   const primaryModel = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
   const BATCH_SIZE = Number(process.env.GEMINI_BATCH_SIZE) || 25;
   const totalBatches = Math.ceil(toFetch.length / BATCH_SIZE);
 
+  const ai = geminiApiKey ? new GoogleGenAI({ apiKey: geminiApiKey }) : null;
+
   for (let i = 0; i < toFetch.length; i += BATCH_SIZE) {
     const chunk = toFetch.slice(i, i + BATCH_SIZE);
     const batchNum = Math.floor(i / BATCH_SIZE) + 1;
-    console.log(`[gemini] Processing batch ${batchNum}/${totalBatches} (${chunk.length} symbols)...`);
+    console.log(`[price-service] Processing batch ${batchNum}/${totalBatches} (${chunk.length} symbols)...`);
 
-    const stockListText = chunk
-      .map((s, idx) => `${idx + 1}. Symbol: ${s.symbol}${s.companyName ? `, Company: ${s.companyName}` : ''}`)
-      .join('\n');
+    let parsed = null;
 
-    const prompt = `You are a financial data assistant. Search Google to find today's or current stock price in Indian Rupees (INR) for the following Indian stocks (traded on NSE/BSE):
+    // 1. Try Gemini primary call if GEMINI_API_KEY is available
+    if (ai) {
+      const stockListText = chunk
+        .map((s, idx) => `${idx + 1}. Symbol: ${s.symbol}${s.companyName ? `, Company: ${s.companyName}` : ''}`)
+        .join('\n');
+
+      const prompt = `You are a financial data assistant. Search Google to find today's or current stock price in Indian Rupees (INR) for the following Indian stocks (traded on NSE/BSE):
 
 ${stockListText}
 
@@ -92,67 +151,52 @@ Instructions:
 3. Do not include markdown formatting or backticks around the JSON.
 4. If a stock price cannot be found, map its symbol to null.`;
 
-    let success = false;
-    const MAX_RETRIES = 3;
-    const modelCandidates = [primaryModel, 'gemini-2.0-flash', 'gemini-2.5-flash'];
-
-    for (let attempt = 1; attempt <= MAX_RETRIES + 1; attempt += 1) {
-      const currentModel = modelCandidates[(attempt - 1) % modelCandidates.length];
       try {
         const response = await ai.models.generateContent({
-          model: currentModel,
+          model: primaryModel,
           contents: prompt,
           config: {
             tools: [{ googleSearch: {} }],
           },
         });
 
-        const parsed = parseJsonFromResponse(response.text);
-
-        if (parsed && typeof parsed === 'object') {
-          for (const item of chunk) {
-            const sym = item.symbol;
-            const rawVal = parsed[sym] !== undefined ? parsed[sym] : parsed[sym.toLowerCase()];
-            const price = typeof rawVal === 'number' && rawVal > 0 ? Number(rawVal.toFixed(2)) : null;
-            results[sym] = price;
-            cache.set(sym, { at: now, price });
-          }
-          success = true;
-          break;
-        } else {
-          console.warn(`[gemini] Attempt ${attempt}/${MAX_RETRIES + 1}: Failed to parse JSON response for batch ${batchNum}`);
-        }
+        parsed = parseJsonFromResponse(response.text);
       } catch (err) {
-        const is429 = err.message && (err.message.includes('429') || err.message.includes('RESOURCE_EXHAUSTED'));
-        const delayMatch = err.message && err.message.match(/retry in ([\d\.]+)s/i);
-        const delayMs = delayMatch ? Math.ceil(parseFloat(delayMatch[1]) * 1000) + 2000 : (is429 ? 35000 : 3000 * attempt);
-
-        if (is429) {
-          console.warn(`[gemini] Rate limit hit (429) on attempt ${attempt}/${MAX_RETRIES + 1}. Waiting ${(delayMs / 1000).toFixed(1)}s before retrying...`);
-        } else {
-          console.warn(`[gemini] Attempt ${attempt}/${MAX_RETRIES + 1} error for batch ${batchNum}: ${err.message}`);
-        }
-
-        if (attempt <= MAX_RETRIES) {
-          await new Promise((resolve) => setTimeout(resolve, delayMs));
-        }
+        console.warn(`[gemini] Gemini call failed for batch ${batchNum}:`, err.message);
       }
+    } else {
+      console.warn(`[gemini] GEMINI_API_KEY not provided. Skipping Gemini.`);
     }
 
-    if (!success) {
-      console.error(`[gemini] Batch ${batchNum} failed after ${MAX_RETRIES + 1} attempts. Setting symbols to null.`);
+    // 2. If Gemini failed or didn't return valid data, fallback to Groq (llama-3.3-70b-versatile)
+    if (!parsed || typeof parsed !== 'object') {
+      console.log(`[fallback] Gemini failed for batch ${batchNum}. Triggering Groq (llama-3.3-70b-versatile) fallback...`);
+      parsed = await fetchStockPricesWithGroq(chunk);
+    }
+
+    if (parsed && typeof parsed === 'object') {
+      for (const item of chunk) {
+        const sym = item.symbol;
+        const rawVal = parsed[sym] !== undefined ? parsed[sym] : parsed[sym.toLowerCase()];
+        const price = typeof rawVal === 'number' && rawVal > 0 ? Number(rawVal.toFixed(2)) : null;
+        results[sym] = price;
+        cache.set(sym, { at: now, price });
+      }
+    } else {
+      console.error(`[price-service] Batch ${batchNum} failed for both Gemini and Groq. Setting prices to null.`);
       for (const item of chunk) {
         results[item.symbol] = null;
       }
     }
 
-    // Delay between batches to stay under RPM limit
+    // Brief 500ms delay between batches
     if (i + BATCH_SIZE < toFetch.length) {
-      await new Promise((resolve) => setTimeout(resolve, 2000));
+      await new Promise((resolve) => setTimeout(resolve, 500));
     }
   }
 
   return results;
 }
 
-module.exports = { fetchStockPricesWithGemini };
+module.exports = { fetchStockPricesWithGemini, fetchStockPricesWithGroq };
+
